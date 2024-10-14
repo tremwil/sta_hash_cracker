@@ -1,10 +1,6 @@
-use std::io::Read;
-use std::time::Instant;
-use std::{fmt::Write};
-use bitvec::field::BitField;
-use bitvec::prelude::Lsb0;
-use bitvec::slice::BitSlice;
-use bitvec::{bitbox, boxed::BitBox, BitArr};
+use std::{fs::{File, OpenOptions}, io::{BufWriter, Write}};
+
+use bitvec::{bitbox, boxed::BitBox, field::BitField};
 
 pub fn sta_hash(bytes: &[u8]) -> u32 {
     let mut h: u32 = 0;
@@ -14,176 +10,235 @@ pub fn sta_hash(bytes: &[u8]) -> u32 {
     h
 }
 
-pub fn print_mat<const N: usize>(m: &[BitBox; N]) {
-    for row in m {
+pub fn print_mat(m: impl AsRef<[BitBox]>) {
+    for row in m.as_ref() {
         println!("{}", row)
     }
 }
 
-pub fn rref(n: usize) -> [BitBox; 16] {
-    let mut mat: [_; 16] = std::array::from_fn(|_| bitbox![0; 4*n]);
+/// Linear equations for `sta_hash(vec) == hash`
+pub fn hash_constraints(n: usize, hash: u32) -> Vec<BitBox> {
+    let mut mat: Vec<_> = (0..32).map(|i| {
+        let mut row = bitbox![0; 8*n +1];
+        row.last_mut().unwrap().set(hash & (1 << i) != 0);
+        row
+    }).collect();
 
     for i in 0..n {
-        for j in 0..4 {
-            let hash_pos = (3*(n - i - 1) + j) % 16;
-            mat[hash_pos].get_mut(4*i+j).map(|mut r| *r ^= true);
+        for j in 0..8 {
+            let hash_pos = (6*(n - i - 1) + j) % 32;
+            mat[hash_pos].get_mut(8*i+j).map(|mut r| *r ^= true);
         }
     }
 
     mat
 }
 
-#[derive(Debug, Clone)]
-struct RowBinding {
-    terms: BitBox,
-    var: usize,
-    scalar: usize,
+/// Linear equations for all characters being within the 32-96 range
+pub fn range_constraints(n: usize) -> Vec<BitBox> {
+    let top_bit_zero = (0..n).map(move |i| {
+        let mut row = bitbox![0; 8*n+1];
+        row.set(8*i + 7, true);
+        row
+    });
+
+    let bits_5_and_6_exclusive = (0..n).map(move |i| {
+        let mut row = bitbox![0; 8*n+1];
+        row[8*i + 5 .. 8*i + 7].store(0b11);
+        row.set(8*n, true);
+        row
+    });
+
+    top_bit_zero.chain(bits_5_and_6_exclusive).collect()
 }
 
-#[derive(Debug, Clone)]
-struct PartialSolve {
-    free_vars: BitBox,
-    bindings: Vec<RowBinding>,
-    solution: BitBox,
-    solved: BitBox,
-    test_buffer: BitBox
+/// Linear equations for a specific character being an exact value
+pub fn char_constraint(n: usize, idx: usize, value: u8) -> Vec<BitBox> {
+    (0..8).map(|i| {
+        let mut row = bitbox![0; 8*n +1];
+        row.set(8*idx + i, true);
+        row.last_mut().unwrap().set(value & (1 << i) != 0);
+        row
+    }).collect()
 }
 
-impl PartialSolve {
-    pub fn new(hash: u32, n: usize) -> Self {
-        let mut bindings = Vec::new();
-        let mut free_vars = bitbox![1; 4*n];
-        let mut solution = bitbox![0; 8*n];
-        let mut solved = bitbox![0; 8*n];
-        let test_buffer = bitbox![0; 8*n];
-    
-        let solution_matrix = rref(n);
-        for (i, row) in solution_matrix.iter().enumerate() {
-            if let Some(bound) = row.first_one() {
-                let mut terms = row.clone();
-                free_vars.set(bound, false);
-                terms.set(bound, false);
+/// Compute the reduced row echelon form of an augmented matrix in Z2.
+pub fn z2_rref(mat: &mut impl AsMut<[BitBox]>) {
+    let mat = mat.as_mut();
+    if mat.is_empty() {
+        return;
+    }
+    let n = mat[0].len();
+    let mut tmp = bitbox![0; n];
+    let mut i = 0;
+    let mut j = 0;
 
-                let scalar = ((hash >> (2 * i)) % 4) as usize;
-                if terms.not_any() {
-                    solution[2*bound .. 2*(bound+1)].store(scalar);
-                    solved[2*bound .. 2*(bound+1)].store(3usize);
-                }
+    while i < n - 1 && j < mat.len() {
+        match mat.iter().skip(j).position(|r| r[i]) {
+            None => { i += 1; continue; },
+            Some(pivot) => mat.swap(j, j + pivot)
+        };
+        tmp.copy_from_bitslice(&mat[j]);
 
-                bindings.push(RowBinding {
-                    var: bound,
-                    terms,
-                    scalar
-                })
+        for k in 0..mat.len() {
+            if k != j && mat[k][i] {
+                mat[k] ^= &tmp;
             }
         }
+
+        j += 1;
+    }
+}
+
+#[derive(Debug)]
+pub struct Basis {
+    dim: usize,
+    vectors: Vec<BitBox>
+}
+
+pub fn solution_basis(rref: &impl AsRef<[BitBox]>) -> Option<Basis> {
+    let rref = rref.as_ref();
+    if rref.is_empty() {
+        return None;
+    }
     
-        PartialSolve {
-            free_vars,
-            bindings,
-            solution,
-            solved,
-            test_buffer
-        }
+    // Find the free variables
+    let mut free_vars = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < rref.len() && j < rref[i].len() - 1 {
+        match rref[i][j] {
+            true => { i += 1; },
+            false => { free_vars.push(j); }
+        }; 
+        j += 1;
     }
 
-    pub fn bind(&mut self, var: usize, value: usize) {
-        self.free_vars.set(var, false);
-
-        for b in &mut self.bindings {
-            let mut m = b.terms.get_mut(var).unwrap();
-            if *m {
-                b.scalar ^= value;
-                *m = false;
-
-                std::mem::drop(m);
-                if b.terms.not_any() {
-                    self.solution[2*b.var .. 2*(b.var + 1)].store(b.scalar);
-                    self.solved[2*b.var .. 2*(b.var + 1)].store(3usize);
-                }
-            };
-        }
-
-        self.solution[2*var .. 2*(var + 1)].store(value);
-        self.solved[2*var .. 2*(var + 1)].store(3usize);
+    // Check remaining rows for any unsolvable constraints
+    if rref.iter().skip(i).any(|r| *r.last().unwrap()) {
+        return None;
     }
 
-    pub fn is_candidate(&mut self) -> bool {
-        // We want to check that the solution chars are within the 32-95 range.
-        // Need two checks for this: 
-        // - bit 7 is 0
-        // - bits 5 and 6 are mutually exclusive (e.g xor to 1)
-        // For the first, a simple AND works
-        // For the second:
-        //  1. apply mask for those bits
-        //  2. count bits, expect 
+    // Go through the rows again and create the basis rows
+    let mut vectors = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < rref.len() && j < rref[i].len() - 1 {
+        vectors.push(match rref[i][j] {
+            true => {
+                i += 1;
+                free_vars.iter()
+                    .map(|&v| rref[i - 1][v])
+                    .chain([*rref[i - 1].last().unwrap()])
+                    .collect()
+            },
+            false => free_vars.iter()
+                .map(|&v| v == j)
+                .chain([false])
+                .collect()
+        }); 
+        j += 1;
+    }
 
-        //println!("{}", &self.solution);
-        
-        if !self.solution.as_raw_slice().iter().all(|b| b & 0x8080_8080_8080_8080 == 0) {
-            return false;
-        }
+    Some(Basis {
+        dim: free_vars.len(),
+        vectors
+    })
+}
 
-        self.test_buffer.copy_from_bitslice(&self.solution);
-        self.test_buffer[..self.solution.len()] ^= &self.solution[1..];
+pub fn generate_solutions(basis: &Basis, mut callback: impl FnMut(&BitBox)) {
+    let mut current_solution = bitbox![0; basis.vectors.len()];
+    let mut xor_buffer = bitbox![0; basis.dim + 1];
+    xor_buffer.set(basis.dim, true);
 
-        let ready_mask = self.solved.as_raw_slice().iter();
-        return self.test_buffer.as_raw_slice().iter().zip(ready_mask).all(
-            |(b, r)| {
-                let m = 0x2020_2020_2020_2020 & r & (r >> 1);
-                //println!("{:064b} vs {:064b}", b, m);
-                b & m == m
-            }
+    for x in 0..(1usize << basis.dim) {
+        current_solution.fill_with(|i| {
+            xor_buffer[..basis.dim].store(x);
+            xor_buffer.set(basis.dim, basis.vectors[i][basis.dim]);
+            xor_buffer &= &basis.vectors[i];
+            xor_buffer.count_ones() % 2 != 0
+        });
+        callback(&current_solution);
+    }
+}
+
+pub fn bits_as_byte_slice(bits: &BitBox) -> &[u8] {
+    assert!(bits.len() % 8 == 0);
+    unsafe {
+        std::slice::from_raw_parts(
+            bits.as_raw_slice().as_ptr() as *const u8,
+            bits.len() / 8
         )
     }
 }
 
 fn main() {
-    const LEN: usize = 9;
-    let h = 0x52bc6ce4; // sta_hash(b"HELP.TXM");
-    println!("target hash: {:x}", h);
+    let n = 8;
+    let hash = 0x52bc6ce4;
 
-    let p = PartialSolve::new(h, LEN);
+    let mut mat = Vec::new();
+    mat.extend(hash_constraints(n, hash));
+    mat.extend(range_constraints(n));
 
-    fn search(p: &PartialSolve, output: &mut Vec<BitBox>) {
-        if let Some(i) = p.free_vars.first_one() {
-            for v in 0..4 {
-                let mut with_value = p.clone();
-                with_value.bind(i, v);
-                if !with_value.is_candidate() {
-                    continue;
-                }
-                search(&with_value, output);
-            }
-        }
-        else {
-            output.push(p.solution.clone());
-        }
+    z2_rref(&mut mat);
+    if let Some(basis) = solution_basis(&mat) {
+        println!("Found {} solutions", 1usize << basis.dim);
+
+        let mut file = BufWriter::new(
+            OpenOptions::new().write(true).truncate(true)
+                .open("matches.txt").unwrap()
+        );
+        generate_solutions(&basis, |s| {
+           file.write(bits_as_byte_slice(s)).unwrap();
+           file.write(b"\n").unwrap();
+        });
+
+        file.flush().unwrap();
     }
 
-    let t = Instant::now();
+    // const LEN: usize = 9;
+    // let h = 0x52bc6ce4; // sta_hash(b"HELP.TXM");
+    // println!("target hash: {:x}", h);
 
-    let mut solutions = Vec::new();
-    search(&p, &mut solutions);
+    // let p = PartialSolve::new(h, LEN);
 
-    println!("Found {} matches in {:?}", solutions.len(), t.elapsed());
-    let filtered: Vec<_> = solutions.into_iter().filter_map(|bits| {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                bits.as_raw_slice() as *const _ as *const u8, 
-                bits.len() / 8
-            )
-        };
+    // fn search(p: &PartialSolve, output: &mut Vec<BitBox>) {
+    //     if let Some(i) = p.free_vars.first_one() {
+    //         for v in 0..4 {
+    //             let mut with_value = p.clone();
+    //             with_value.bind(i, v);
+    //             if !with_value.is_candidate() {
+    //                 continue;
+    //             }
+    //             search(&with_value, output);
+    //         }
+    //     }
+    //     else {
+    //         output.push(p.solution.clone());
+    //     }
+    // }
 
-        if bytes.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b'.')
-            && bytes.first().map(|b| b.is_ascii_alphabetic()) == Some(true) {
-            Some(String::from_utf8_lossy(bytes).to_string())
-        }
-        else {
-            None
-        }
-    }).collect();
+    // let t = Instant::now();
 
-    println!("Filtered to {} matches and dumped to matches.txt", filtered.len());
-    std::fs::write("matches.txt", filtered.join("\n")).unwrap();
+    // let mut solutions = Vec::new();
+    // search(&p, &mut solutions);
+
+    // println!("Found {} matches in {:?}", solutions.len(), t.elapsed());
+    // let filtered: Vec<_> = solutions.into_iter().filter_map(|bits| {
+    //     let bytes = unsafe {
+    //         std::slice::from_raw_parts(
+    //             bits.as_raw_slice() as *const _ as *const u8, 
+    //             bits.len() / 8
+    //         )
+    //     };
+
+    //     if bytes.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b'.')
+    //         && bytes.first().map(|b| b.is_ascii_alphabetic()) == Some(true) {
+    //         Some(String::from_utf8_lossy(bytes).to_string())
+    //     }
+    //     else {
+    //         None
+    //     }
+    // }).collect();
+
+    // println!("Filtered to {} matches and dumped to matches.txt", filtered.len());
+    // std::fs::write("matches.txt", filtered.join("\n")).unwrap();
 }
