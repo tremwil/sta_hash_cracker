@@ -1,0 +1,13 @@
+[package]
+name = "sta_hash_cracker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bitvec = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+debug-assertions = false
+overflow-checks = false
